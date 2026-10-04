@@ -1,0 +1,78 @@
+# HabitableZone: this site is based on the original Habitable Zone discussion board created by Robert Shepherd.
+#
+# CME RELAY — fetches NASA's list of coronal mass ejections for the board.
+#
+# NASA's CCMC (which publishes the list, called DONKI) does not answer the
+# board's server at DigitalOcean, so this job, run by GitHub every 30 minutes,
+# fetches the list instead and saves it as cmes.json in this repository. The
+# board reads that file (CME_API in the board's .env; see src/cme.js).
+#
+# WHERE IT LIVES
+#   Not in the board's own repository: it goes in a separate PUBLIC repository
+#   (e.g. hz-cme-relay), at .github/workflows/cme-relay.yml. Public, because
+#   the board can then read the file without a password, and because GitHub
+#   runs scheduled jobs in public repositories free; in a private one this
+#   would use most of the free monthly allowance. The data is NASA's and
+#   public; nothing private is in it.
+#
+# HOW IT BEHAVES
+#   - It saves (commits) only when the list has changed, or every 6 hours
+#     anyway, so the board can tell a quiet Sun from a stopped relay.
+#   - If NASA cannot be reached it leaves the old file alone and finishes
+#     with a warning rather than an error, so you are not emailed every half
+#     hour during a NASA outage. Its runs are listed on the Actions tab.
+#   - GitHub pauses scheduled jobs in a repository with no activity for 60
+#     days; the 6-hourly saves count as activity. If it is ever paused, the
+#     Actions tab has a button to turn it back on.
+#   - GitHub's schedule is approximate: runs can be 5-15 minutes late.
+
+name: CME relay
+
+on:
+  schedule:
+    - cron: '7,37 * * * *'      # twice an hour, off the busy top of the hour
+  workflow_dispatch:            # the "Run workflow" button, for testing
+
+permissions:
+  contents: write               # to save cmes.json in this repository
+
+concurrency: cme-relay
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the last 14 days of CMEs from NASA DONKI and save if changed
+        run: |
+          start=$(date -u -d '14 days ago' +%F)
+          end=$(date -u -d tomorrow +%F)
+          url="https://ccmc.gsfc.nasa.gov/DONKI-API/get/CME?startDate=$start&endDate=$end"
+          if ! curl -sS --fail --retry 3 --retry-delay 20 --max-time 90 \
+                -H 'Accept: application/json' -A "HabitableZone-CME-relay (+https://github.com/$GITHUB_REPOSITORY)" \
+                "$url" -o raw.json; then
+            echo "::warning::Could not reach NASA DONKI; cmes.json left as it was."
+            exit 0
+          fi
+          if ! jq -e 'type == "array"' raw.json > /dev/null; then
+            echo "::warning::DONKI did not return a list; cmes.json left as it was."
+            head -c 300 raw.json; exit 0
+          fi
+          now=$(date -u +%FT%TZ)
+          # Unchanged list and saved under 6 hours ago: nothing to do.
+          if [ -f cmes.json ] && jq -e --slurpfile new raw.json '.rows == $new[0]' cmes.json > /dev/null; then
+            last=$(jq -r .fetched cmes.json)
+            if [ $(( $(date -u +%s) - $(date -u -d "$last" +%s) )) -lt 21600 ]; then
+              echo "Unchanged since $last; not saving."; exit 0
+            fi
+          fi
+          jq -c --arg t "$now" '{fetched: $t, source: "NASA CCMC DONKI", rows: .}' raw.json > cmes.json
+          rm raw.json
+          echo "$(jq '.rows | length' cmes.json) CMEs saved."
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add cmes.json
+          git commit -q -m "CMEs as of $now"
+          git push -q

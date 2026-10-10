@@ -1,0 +1,122 @@
+# HabitableZone: this site is based on the original Habitable Zone discussion board created by Robert Shepherd.
+#
+# TNS RELAY — fetches the IAU Transient Name Server's daily files of new
+# supernovae, novae and other transients for the board.
+#
+# TNS refuses the board's server at DigitalOcean (HTTP 403 for every page,
+# whatever the key), so this job, run by GitHub every 3 hours, downloads the
+# daily files instead, with the board's TNS bot key, and saves the brighter
+# objects as tns.json in this repository. The board reads that file
+# (TNS_RELAY_URL in the board's .env; see src/alerts-skywatch.js).
+#
+# WHERE IT LIVES
+#   Alongside cme-relay.yml, in the same PUBLIC repository (hz-cme-relay), at
+#   .github/workflows/tns-relay.yml. The file it saves holds only TNS's public
+#   data; the key is kept as three repository SECRETS (Settings -> Secrets and
+#   variables -> Actions -> New repository secret), never in the file:
+#     TNS_BOT_ID     198037
+#     TNS_BOT_NAME   HabitableZone_board
+#     TNS_API_KEY    the bot's key
+#
+# WHAT IT KEEPS
+#   The last 10 days' files, each cut down to what the board could post:
+#   objects found at magnitude 17 or brighter, or with a redshift of 0.01 or
+#   less (a nearby galaxy), with only the columns the board uses. The board
+#   applies its own, stricter thresholds (ALERTS_SN_MAX_MAG and so on).
+#
+# HOW IT BEHAVES
+#   - It saves (commits) only when something changed, or every 12 hours
+#     anyway, so the board can tell quiet days from a stopped relay.
+#   - If TNS cannot be reached it leaves the old file alone and finishes with
+#     a warning, not an error. Its runs are listed on the Actions tab; a run
+#     whose log says "HTTP 403" means TNS refuses GitHub's servers too.
+
+name: TNS relay
+
+on:
+  schedule:
+    - cron: '23 */3 * * *'      # every 3 hours, off the busy top of the hour
+  workflow_dispatch:            # the "Run workflow" button, for testing
+
+permissions:
+  contents: write               # to save tns.json in this repository
+
+concurrency: tns-relay
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch the last three days' files from TNS and save if changed
+        env:
+          TNS_BOT_ID: ${{ secrets.TNS_BOT_ID }}
+          TNS_BOT_NAME: ${{ secrets.TNS_BOT_NAME }}
+          TNS_API_KEY: ${{ secrets.TNS_API_KEY }}
+        shell: python
+        run: |
+          import csv, io, json, os, subprocess, sys, time, urllib.parse, urllib.request, urllib.error, zipfile
+          from datetime import datetime, timedelta, timezone
+
+          if not (os.environ['TNS_BOT_ID'] and os.environ['TNS_BOT_NAME'] and os.environ['TNS_API_KEY']):
+              print('::error::The TNS_BOT_ID, TNS_BOT_NAME and TNS_API_KEY secrets are not all set.'); sys.exit(1)
+          ua = 'tns_marker{"tns_id":%d,"type":"bot","name":"%s"}' % (int(os.environ['TNS_BOT_ID']), os.environ['TNS_BOT_NAME'])
+          base = 'https://www.wis-tns.org/system/files/tns_public_objects/tns_public_objects_%s.csv.zip'
+          KEEP = ['name_prefix', 'name', 'type', 'ra', 'declination', 'redshift', 'discoverydate',
+                  'discoverymag', 'discmagfilter', 'internal_names', 'reporting_group']
+
+          def num(v):
+              try: return float(v)
+              except (TypeError, ValueError): return None
+
+          try: old = json.load(open('tns.json'))
+          except Exception: old = {'days': {}}
+          days = dict(old.get('days', {}))
+          now = datetime.now(timezone.utc)
+          changed = False
+          for back in (3, 2, 1):
+              day = (now - timedelta(days=back)).strftime('%Y%m%d')
+              req = urllib.request.Request(base % day, data=urllib.parse.urlencode({'api_key': os.environ['TNS_API_KEY']}).encode(),
+                                           headers={'User-Agent': ua}, method='POST')
+              try:
+                  with urllib.request.urlopen(req, timeout=90) as r: blob = r.read()
+              except urllib.error.HTTPError as e:
+                  if e.code == 404: print(f'{day}: not published yet'); continue
+                  body = e.read()[:300].decode('utf8', 'replace')
+                  print(f'::warning::{day}: HTTP {e.code} from TNS: {body}'); continue
+              except Exception as e:
+                  print(f'::warning::{day}: could not reach TNS: {e}'); continue
+              time.sleep(3)
+              try:
+                  z = zipfile.ZipFile(io.BytesIO(blob))
+                  text = z.read(z.namelist()[0]).decode('utf8')
+              except Exception as e:
+                  print(f'::warning::{day}: not a zip file ({e}): {blob[:200]!r}'); continue
+              lines = text.splitlines()
+              start = next((i for i, l in enumerate(lines) if '"name"' in l or l.startswith('name') or ',name,' in l), None)
+              if start is None: print(f'::warning::{day}: no column names'); continue
+              rows = list(csv.DictReader(io.StringIO('\n'.join(lines[start:]))))
+              rows = [{k: (r.get(k) or '').strip() for k in KEEP} for r in rows]
+              keep = [r for r in rows if r['name'] and (((num(r['discoverymag']) or 99) <= 17) or (0 < (num(r['redshift']) or 9) <= 0.01))]
+              print(f'{day}: {len(rows)} objects, {len(keep)} kept')
+              if days.get(day) != keep: days[day] = keep; changed = True
+
+          for d in sorted(days)[:-10]: del days[d]; changed = True
+          last = old.get('fetched')
+          stale = not last or (now - datetime.fromisoformat(last.replace('Z', '+00:00'))).total_seconds() > 12 * 3600
+          if not changed and not stale:
+              print(f'Unchanged since {last}; not saving.'); sys.exit(0)
+          if not days:
+              print('::warning::Nothing fetched yet; not saving.'); sys.exit(0)
+          stamp = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+          json.dump({'fetched': stamp, 'source': 'IAU Transient Name Server (wis-tns.org), public objects', 'days': days},
+                    open('tns.json', 'w'), separators=(',', ':'))
+          git = lambda *a: subprocess.run(['git', *a], check=True)
+          git('config', 'user.name', 'github-actions[bot]')
+          git('config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
+          git('add', 'tns.json')
+          git('commit', '-q', '-m', f'TNS objects as of {stamp}')
+          git('pull', '--rebase', '-q')        # the CME relay may have saved in the meantime
+          git('push', '-q')
